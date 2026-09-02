@@ -48,11 +48,14 @@ public class SwarmuiImageEncriptorExtension : Extension
     /// <summary>Tracks active encryption settings per session ID (Enabled flag, Secret Code).</summary>
     public static readonly ConcurrentDictionary<string, (bool Enabled, string Code)> SessionSettings = new();
 
-    /// <summary>Global fallback state when session ID is not isolated.</summary>
-    public static volatile bool GlobalEnabled = false;
+    /// <summary>Path to the JSON file where settings are saved persistently.</summary>
+    public static string SettingsFilePath => Utilities.CombinePathWithAbsolute(Environment.CurrentDirectory, Program.DataDir, "image_encryptor_settings.json");
 
-    /// <summary>Global fallback encryption code.</summary>
-    public static volatile string GlobalCode = "";
+    /// <summary>Global fallback state when session ID is not isolated, enabled by default.</summary>
+    public static volatile bool GlobalEnabled = true;
+
+    /// <summary>Global fallback encryption code, defaulted to '1234'.</summary>
+    public static volatile string GlobalCode = "1234";
 
     /// <summary>File system watcher monitoring the output directory for newly created images.</summary>
     public static FileSystemWatcher OutputWatcher;
@@ -67,17 +70,19 @@ public class SwarmuiImageEncriptorExtension : Extension
         StyleSheetFiles.Add("Assets/image_encriptor.css");
     }
 
-    /// <summary>Called when the extension initializes, registering API routes, parameters, generation hooks, and file watcher.</summary>
+    /// <summary>Called when the extension initializes, registering API routes, parameters, generation hooks, settings, and file watcher.</summary>
     public override void OnInit()
     {
         Logs.Init("Swarmui-Image-Encriptor Extension loaded.");
+
+        LoadSettingsFromDisk();
 
         EncryptionGroup = new("Image Encryption", Toggles: false, Open: false, IsAdvanced: true, Description: "Options for encrypting generated output images with AES-256-GCM.");
 
         EncryptionCodeParam = T2IParamTypes.Register<string>(new(
             "Image Encryption Code",
             "Secret passcode or PIN used to encrypt generated output images on disk with AES-256-GCM. When set and enabled, encryption activates automatically.",
-            "",
+            "1234",
             Group: EncryptionGroup,
             Toggleable: true,
             ViewType: ParamViewType.NORMAL,
@@ -101,6 +106,59 @@ public class SwarmuiImageEncriptorExtension : Extension
     public override void OnPreLaunch()
     {
         RegisterHttpMiddleware();
+    }
+
+    /// <summary>Loads persistent encryption settings from disk, or initializes defaults if not present.</summary>
+    public static void LoadSettingsFromDisk()
+    {
+        try
+        {
+            string path = SettingsFilePath;
+            if (File.Exists(path))
+            {
+                string jsonText = File.ReadAllText(path);
+                JObject jObj = JObject.Parse(jsonText);
+                GlobalEnabled = jObj.Value<bool?>("enabled") ?? true;
+                GlobalCode = jObj.Value<string>("code") ?? "1234";
+                Logs.Init($"[Swarmui-Image-Encriptor] Loaded settings from disk: Enabled={GlobalEnabled}, HasCode={!string.IsNullOrWhiteSpace(GlobalCode)}");
+            }
+            else
+            {
+                GlobalEnabled = true;
+                GlobalCode = "1234";
+                SaveSettingsToDisk();
+            }
+        }
+        catch (Exception ex)
+        {
+            Logs.Error($"[Swarmui-Image-Encriptor] Failed to load settings from disk: {ex.ReadableString()}");
+            GlobalEnabled = true;
+            GlobalCode = "1234";
+        }
+    }
+
+    /// <summary>Saves current encryption settings to disk for permanent persistence across restarts.</summary>
+    public static void SaveSettingsToDisk()
+    {
+        try
+        {
+            string path = SettingsFilePath;
+            string dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+            JObject jObj = new()
+            {
+                ["enabled"] = GlobalEnabled,
+                ["code"] = GlobalCode
+            };
+            File.WriteAllText(path, jObj.ToString());
+        }
+        catch (Exception ex)
+        {
+            Logs.Error($"[Swarmui-Image-Encriptor] Failed to save settings to disk: {ex.ReadableString()}");
+        }
     }
 
     /// <summary>Registers the ASP.NET Core HTTP middleware that intercepts ViewOutput calls to seamlessly decrypt images on-the-fly for the web UI.</summary>
@@ -568,13 +626,14 @@ public class SwarmuiImageEncriptorExtension : Extension
         return plaintext;
     }
 
-    /// <summary>API endpoint to update the full encryption state (Enabled switch and Secret Code).</summary>
+    /// <summary>API endpoint to update the full encryption state (Enabled switch and Secret Code), and saves to disk.</summary>
     public static Task<JObject> ImageEncryptor_SetState(Session session, bool enabled, string code)
     {
         string cleanCode = (code ?? "").Trim();
         SessionSettings[session.ID] = (enabled, cleanCode);
         GlobalEnabled = enabled;
         GlobalCode = cleanCode;
+        SaveSettingsToDisk();
 
         Logs.Info($"[Swarmui-Image-Encriptor] Encryption state updated for session '{session.ID}': Enabled={enabled}, HasCode={!string.IsNullOrWhiteSpace(cleanCode)}");
 
@@ -582,7 +641,8 @@ public class SwarmuiImageEncriptorExtension : Extension
         {
             ["success"] = true,
             ["enabled"] = enabled,
-            ["has_code"] = !string.IsNullOrWhiteSpace(cleanCode)
+            ["has_code"] = !string.IsNullOrWhiteSpace(cleanCode),
+            ["code"] = cleanCode
         });
     }
 
@@ -594,11 +654,12 @@ public class SwarmuiImageEncriptorExtension : Extension
         {
             ["success"] = true,
             ["enabled"] = isEnabled,
-            ["has_code"] = !string.IsNullOrWhiteSpace(code)
+            ["has_code"] = !string.IsNullOrWhiteSpace(code),
+            ["code"] = code
         });
     }
 
-    /// <summary>API endpoint to store or clear the active encryption code for the current session.</summary>
+    /// <summary>API endpoint to store or clear the active encryption code for the current session, and saves to disk.</summary>
     public static Task<JObject> ImageEncryptor_SetSessionCode(Session session, string code)
     {
         string cleanCode = (code ?? "").Trim();
@@ -611,6 +672,7 @@ public class SwarmuiImageEncriptorExtension : Extension
 
         SessionSettings[session.ID] = (isEnabled, cleanCode);
         GlobalCode = cleanCode;
+        SaveSettingsToDisk();
 
         return Task.FromResult(new JObject()
         {

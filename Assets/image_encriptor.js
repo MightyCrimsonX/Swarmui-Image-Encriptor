@@ -1,13 +1,13 @@
 /**
  * Helper class for Swarmui-Image-Encriptor Extension in SwarmUI.
  * Manages the Left Sidebar security tab, real-time AES-256 encryption status,
- * enable/disable toggle, parameter synchronization, and on-the-fly image decryption.
+ * enable/disable toggle, parameter synchronization, persistent settings, and on-the-fly image decryption.
  */
 class SwarmuiImageEncriptorHelper {
 
     constructor() {
         this.isEnabled = true;
-        this.currentCode = '';
+        this.currentCode = '1234';
         this.isCodeVisible = false;
         this.magicHeader = [0x53, 0x57, 0x41, 0x52, 0x4D, 0x45, 0x4E, 0x43]; // 'SWARMENC'
         this.headerSize = 53;
@@ -277,7 +277,7 @@ class SwarmuiImageEncriptorHelper {
     }
 
     /**
-     * Sets the enabled/disabled state of the encryptor.
+     * Sets the enabled/disabled state of the encryptor and persists it.
      */
     setEnabled(enabled) {
         this.isEnabled = enabled;
@@ -287,6 +287,7 @@ class SwarmuiImageEncriptorHelper {
         }
 
         this.updateStatusBadge();
+        this.syncParamWithGenInput();
         this.syncStateWithServer();
 
         try {
@@ -296,7 +297,7 @@ class SwarmuiImageEncriptorHelper {
     }
 
     /**
-     * Sets the active encryption code, updates the UI and syncs with server.
+     * Sets the active encryption code, updates the UI, persists it and syncs with server.
      */
     setCode(newCode) {
         this.currentCode = (newCode || '').trim();
@@ -323,39 +324,56 @@ class SwarmuiImageEncriptorHelper {
     }
 
     /**
-     * Synchronizes state with the server via WebAPI.
+     * Synchronizes state with the server via WebAPI (which writes to disk).
      */
     syncStateWithServer() {
         genericRequest('ImageEncryptor_SetState', {
             enabled: this.isEnabled,
             code: this.currentCode
         }, (data) => {
-            // State updated on server
+            // State saved on server
         });
     }
 
     /**
-     * Loads saved code and toggle state from storage.
+     * Loads saved code and toggle state from storage (defaulting to enabled + '1234') and syncs with server.
      */
     loadSavedState() {
         try {
             let savedEnabled = localStorage.getItem('swarm_encryptor_enabled');
             if (savedEnabled !== null) {
                 this.isEnabled = savedEnabled == 'true';
-                let toggleSwitch = document.getElementById('encryptor_enable_toggle');
-                if (toggleSwitch) {
-                    toggleSwitch.checked = this.isEnabled;
-                }
+            }
+            else {
+                this.isEnabled = true;
+                localStorage.setItem('swarm_encryptor_enabled', 'true');
             }
 
-            let savedCode = sessionStorage.getItem('swarm_encryptor_code') || localStorage.getItem('swarm_encryptor_code');
-            if (savedCode) {
+            let toggleSwitch = document.getElementById('encryptor_enable_toggle');
+            if (toggleSwitch) {
+                toggleSwitch.checked = this.isEnabled;
+            }
+
+            let savedCode = localStorage.getItem('swarm_encryptor_code') || sessionStorage.getItem('swarm_encryptor_code');
+            if (savedCode !== null && savedCode !== undefined) {
                 this.setCode(savedCode);
             }
             else {
-                this.updateStatusBadge();
-                this.syncStateWithServer();
+                this.setCode('1234');
+                localStorage.setItem('swarm_encryptor_code', '1234');
             }
+
+            // Sync with server state from disk in case server has custom saved values
+            genericRequest('ImageEncryptor_GetState', {}, (data) => {
+                if (data && data.success) {
+                    if (data.code !== undefined && savedCode === null) {
+                        this.setCode(data.code || '1234');
+                    }
+                    if (data.enabled !== undefined && savedEnabled === null) {
+                        this.setEnabled(data.enabled);
+                    }
+                }
+            });
         }
         catch (e) {
             this.updateStatusBadge();
@@ -385,7 +403,7 @@ class SwarmuiImageEncriptorHelper {
             card.className = 'encryptor-status-card active';
             dot.className = 'encryptor-status-dot active';
             title.innerText = '🟢 Encryption Active (AES-256)';
-            desc.innerText = 'All newly generated output images will be instantly encrypted on disk with your code.';
+            desc.innerText = `Disk encryption is active. Passcode: "${this.currentCode}"`;
         }
         else {
             card.className = 'encryptor-status-card waiting';
@@ -416,7 +434,7 @@ class SwarmuiImageEncriptorHelper {
         if (typeof getGenInput == 'function') {
             let originalGetGenInput = getGenInput;
             let self = this;
-            window.getGenInput = function() {
+            window.getGenInput = function () {
                 let res = originalGetGenInput.apply(this, arguments);
                 if (self.isEnabled && self.currentCode && self.currentCode.length > 0) {
                     res['imageencryptioncode'] = self.currentCode;
@@ -531,7 +549,7 @@ class SwarmuiImageEncriptorHelper {
                 mime = 'image/webp';
             }
 
-            let blob = new Blob([decryptedBytes || decryptedBuffer], { type: mime });
+            let blob = new Blob([decryptedBuffer], { type: mime });
             this.showDecryptedPreview(blob);
         }
         catch (err) {
