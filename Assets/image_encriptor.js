@@ -1,9 +1,9 @@
 /**
- * Helper class for Image Encryptor Extension in SwarmUI.
+ * Helper class for Swarmui-Image-Encriptor Extension in SwarmUI.
  * Manages the Left Sidebar security tab, real-time AES-256 encryption status,
  * enable/disable toggle, parameter synchronization, and on-the-fly image decryption.
  */
-class ImageEncryptorHelper {
+class SwarmuiImageEncriptorHelper {
 
     constructor() {
         this.isEnabled = true;
@@ -531,11 +531,11 @@ class ImageEncryptorHelper {
                 mime = 'image/webp';
             }
 
-            let blob = new Blob([decryptedBuffer], { type: mime });
+            let blob = new Blob([decryptedBytes || decryptedBuffer], { type: mime });
             this.showDecryptedPreview(blob);
         }
         catch (err) {
-            console.error('[ImageEncryptor] Decryption error:', err);
+            console.error('[Swarmui-Image-Encriptor] Decryption error:', err);
             alert('Decryption failed: Incorrect passcode / PIN or corrupted file.');
         }
     }
@@ -559,16 +559,16 @@ class ImageEncryptorHelper {
     }
 }
 
-let imageEncryptorHelper = new ImageEncryptorHelper();
+let swarmuiImageEncriptorHelper = new SwarmuiImageEncriptorHelper();
 
 // Initialize when session/page is ready
 if (typeof sessionReadyCallbacks != 'undefined') {
     sessionReadyCallbacks.push(() => {
-        imageEncryptorHelper.init();
+        swarmuiImageEncriptorHelper.init();
     });
 }
 else {
     document.addEventListener('DOMContentLoaded', () => {
-        imageEncryptorHelper.init();
+        swarmuiImageEncriptorHelper.init();
     });
 }

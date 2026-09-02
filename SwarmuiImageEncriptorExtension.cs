@@ -22,10 +22,10 @@ using System.Threading.Tasks;
 using Image = SwarmUI.Utils.Image;
 using ISImage = SixLabors.ImageSharp.Image;
 
-namespace SwarmImageEncryptorExtension;
+namespace SwarmuiImageEncriptorExtension;
 
-/// <summary>Extension for SwarmUI that allows generated images to be encrypted with AES-256-GCM on disk instantly when generated, while remaining seamlessly viewable in the UI with a secret code.</summary>
-public class ImageEncryptorExtension : Extension
+/// <summary>Extension for SwarmUI (Swarmui-Image-Encriptor) that allows generated images to be encrypted with AES-256-GCM on disk instantly when generated, while remaining seamlessly viewable in the UI with a secret code.</summary>
+public class SwarmuiImageEncriptorExtension : Extension
 {
     /// <summary>Magic header identifier for SwarmUI encrypted files (8 bytes ASCII 'SWARMENC').</summary>
     public static readonly byte[] MagicHeader = "SWARMENC"u8.ToArray();
@@ -63,14 +63,14 @@ public class ImageEncryptorExtension : Extension
     /// <summary>Called when the extension is prepared, registering script and stylesheet assets.</summary>
     public override void OnPreInit()
     {
-        ScriptFiles.Add("Assets/image_encryptor.js");
-        StyleSheetFiles.Add("Assets/image_encryptor.css");
+        ScriptFiles.Add("Assets/image_encriptor.js");
+        StyleSheetFiles.Add("Assets/image_encriptor.css");
     }
 
-    /// <summary>Called when the extension initializes, registering API routes, parameters, generation hooks, and HTTP middleware.</summary>
+    /// <summary>Called when the extension initializes, registering API routes, parameters, generation hooks, and file watcher.</summary>
     public override void OnInit()
     {
-        Logs.Init("Image Encryptor Extension loaded.");
+        Logs.Init("Swarmui-Image-Encriptor Extension loaded.");
 
         EncryptionGroup = new("Image Encryption", Toggles: false, Open: false, IsAdvanced: true, Description: "Options for encrypting generated output images with AES-256-GCM.");
 
@@ -238,7 +238,7 @@ public class ImageEncryptorExtension : Extension
                     }
                     catch (Exception ex)
                     {
-                        Logs.Debug($"[ImageEncryptor] Failed to generate thumbnail preview: {ex.Message}");
+                        Logs.Debug($"[Swarmui-Image-Encriptor] Failed to generate thumbnail preview: {ex.Message}");
                     }
                 }
 
@@ -262,7 +262,7 @@ public class ImageEncryptorExtension : Extension
         }
         catch (Exception ex)
         {
-            Logs.Error($"[ImageEncryptor] Failed to register HTTP middleware: {ex.ReadableString()}");
+            Logs.Error($"[Swarmui-Image-Encriptor] Failed to register HTTP middleware: {ex.ReadableString()}");
         }
     }
 
@@ -287,11 +287,11 @@ public class ImageEncryptorExtension : Extension
 
             OutputWatcher.Created += OnOutputFileEvent;
             OutputWatcher.Changed += OnOutputFileEvent;
-            Logs.Init($"[ImageEncryptor] Active file watcher on output directory: '{outputPath}'");
+            Logs.Init($"[Swarmui-Image-Encriptor] Active file watcher on output directory: '{outputPath}'");
         }
         catch (Exception ex)
         {
-            Logs.Error($"[ImageEncryptor] Failed to start output file watcher: {ex.ReadableString()}");
+            Logs.Error($"[Swarmui-Image-Encriptor] Failed to start output file watcher: {ex.ReadableString()}");
         }
     }
 
@@ -382,7 +382,7 @@ public class ImageEncryptorExtension : Extension
             byte[] encrypted = EncryptBytes(fileBytes, code.Trim());
             RecentlyEncryptedFiles[normPath] = Environment.TickCount64;
             await File.WriteAllBytesAsync(fullPath, encrypted);
-            Logs.Info($"[ImageEncryptor] Successfully encrypted output file on disk: '{fullPath}'");
+            Logs.Info($"[Swarmui-Image-Encriptor] Successfully encrypted output file on disk: '{fullPath}'");
 
             // Ensure .swarm.json metadata file is written with valid JSON so OutputMetadataTracker can read history without decoding the encrypted PNG
             string jsonPath = Path.ChangeExtension(fullPath, ".swarm.json");
@@ -393,7 +393,7 @@ public class ImageEncryptorExtension : Extension
         }
         catch (Exception ex)
         {
-            Logs.Error($"[ImageEncryptor] Error encrypting file '{fullPath}': {ex.ReadableString()}");
+            Logs.Error($"[Swarmui-Image-Encriptor] Error encrypting file '{fullPath}': {ex.ReadableString()}");
         }
     }
 
@@ -443,7 +443,7 @@ public class ImageEncryptorExtension : Extension
         }
         catch (Exception ex)
         {
-            Logs.Error($"[ImageEncryptor] Error during post-generation hook: {ex.ReadableString()}");
+            Logs.Error($"[Swarmui-Image-Encriptor] Error during post-generation hook: {ex.ReadableString()}");
         }
     }
 
@@ -483,7 +483,7 @@ public class ImageEncryptorExtension : Extension
         }
         catch (Exception ex)
         {
-            Logs.Error($"[ImageEncryptor] Error during post-batch sweep: {ex.ReadableString()}");
+            Logs.Error($"[Swarmui-Image-Encriptor] Error during post-batch sweep: {ex.ReadableString()}");
         }
     }
 
@@ -576,7 +576,7 @@ public class ImageEncryptorExtension : Extension
         GlobalEnabled = enabled;
         GlobalCode = cleanCode;
 
-        Logs.Info($"[ImageEncryptor] Encryption state updated for session '{session.ID}': Enabled={enabled}, HasCode={!string.IsNullOrWhiteSpace(cleanCode)}");
+        Logs.Info($"[Swarmui-Image-Encriptor] Encryption state updated for session '{session.ID}': Enabled={enabled}, HasCode={!string.IsNullOrWhiteSpace(cleanCode)}");
 
         return Task.FromResult(new JObject()
         {
@@ -746,7 +746,7 @@ public class ImageEncryptorExtension : Extension
         }
         catch (Exception ex)
         {
-            Logs.Error($"[ImageEncryptor] Decrypt request error: {ex.ReadableString()}");
+            Logs.Error($"[Swarmui-Image-Encriptor] Decrypt request error: {ex.ReadableString()}");
             return new JObject() { ["success"] = false, ["error"] = $"Error decrypting image: {ex.Message}" };
         }
     }
