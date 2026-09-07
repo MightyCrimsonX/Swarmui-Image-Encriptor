@@ -63,6 +63,9 @@ public class SwarmuiImageEncriptorExtension : Extension
     /// <summary>Tracks timestamps of recently encrypted files to avoid recursion in file change events.</summary>
     public static readonly ConcurrentDictionary<string, long> RecentlyEncryptedFiles = new();
 
+    /// <summary>Tracks paths currently being processed for encryption to avoid concurrent duplicate runs from rapid file watcher events.</summary>
+    public static readonly ConcurrentDictionary<string, byte> ActiveProcessingFiles = new();
+
     /// <summary>Called when the extension is prepared, registering script and stylesheet assets.</summary>
     public override void OnPreInit()
     {
@@ -220,12 +223,25 @@ public class SwarmuiImageEncriptorExtension : Extension
                     return;
                 }
 
-                byte[] fileBytes;
-                try
+                byte[] fileBytes = null;
+                for (int r = 0; r < 5; r++)
                 {
-                    fileBytes = await File.ReadAllBytesAsync(realFilePath);
+                    try
+                    {
+                        fileBytes = await File.ReadAllBytesAsync(realFilePath);
+                        break;
+                    }
+                    catch (IOException)
+                    {
+                        await Task.Delay(40);
+                    }
+                    catch
+                    {
+                        break;
+                    }
                 }
-                catch
+
+                if (fileBytes is null)
                 {
                     await next();
                     return;
@@ -372,6 +388,90 @@ public class SwarmuiImageEncriptorExtension : Extension
         });
     }
 
+    /// <summary>Checks whether an image file's raw byte buffer appears complete based on format-specific headers and end markers.</summary>
+    public static bool IsImageComplete(byte[] data, string ext)
+    {
+        if (data is null)
+        {
+            return false;
+        }
+
+        if (ext == ".png")
+        {
+            if (data.Length < 67)
+            {
+                return false;
+            }
+
+            // Must start with PNG signature: 89 50 4E 47 0D 0A 1A 0A
+            if (data[0] != 0x89 || data[1] != 0x50 || data[2] != 0x4E || data[3] != 0x47 ||
+                data[4] != 0x0D || data[5] != 0x0A || data[6] != 0x1A || data[7] != 0x0A)
+            {
+                return false;
+            }
+
+            // Must contain IEND chunk ("IEND" in ASCII = 0x49, 0x45, 0x4E, 0x44) within the last 64 bytes
+            int searchStart = Math.Max(0, data.Length - 64);
+            for (int i = data.Length - 8; i >= searchStart; i--)
+            {
+                if (data[i] == 0x49 && data[i + 1] == 0x45 && data[i + 2] == 0x4E && data[i + 3] == 0x44)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        if (ext == ".jpg" || ext == ".jpeg")
+        {
+            if (data.Length < 128)
+            {
+                return false;
+            }
+
+            // Must start with SOI: FF D8
+            if (data[0] != 0xFF || data[1] != 0xD8)
+            {
+                return false;
+            }
+
+            // Must end with EOI: FF D9 within the last 32 bytes
+            int searchStart = Math.Max(0, data.Length - 32);
+            for (int i = data.Length - 2; i >= searchStart; i--)
+            {
+                if (data[i] == 0xFF && data[i + 1] == 0xD9)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        if (ext == ".webp")
+        {
+            if (data.Length < 30)
+            {
+                return false;
+            }
+
+            // Must start with RIFF .... WEBP
+            if (data[0] != 'R' || data[1] != 'I' || data[2] != 'F' || data[3] != 'F' ||
+                data[8] != 'W' || data[9] != 'E' || data[10] != 'B' || data[11] != 'P')
+            {
+                return false;
+            }
+
+            // RIFF chunk size at offset 4 (little-endian uint32) + 8 is the total file size
+            uint riffSize = BitConverter.ToUInt32(data, 4);
+            long expectedSize = (long)riffSize + 8;
+            return data.Length >= expectedSize;
+        }
+
+        return data.Length > 0;
+    }
+
     /// <summary>Processes a file to encrypt it on disk if encryption is enabled and an encryption key is available.</summary>
     public static async Task ProcessFileForEncryption(string fullPath)
     {
@@ -382,76 +482,208 @@ public class SwarmuiImageEncriptorExtension : Extension
 
         string normPath = Path.GetFullPath(fullPath).Replace('\\', '/');
 
-        // Prevent recursion on file write
-        if (RecentlyEncryptedFiles.TryGetValue(normPath, out long lastTime) && Environment.TickCount64 - lastTime < 6000)
+        // Prevent recursion and duplicate processing
+        if (RecentlyEncryptedFiles.TryGetValue(normPath, out long lastTime) && Environment.TickCount64 - lastTime < 10000)
         {
             return;
         }
 
-        (bool isEnabled, string code) = GetActiveEncryptionState();
-        if (!isEnabled || string.IsNullOrWhiteSpace(code))
-        {
-            return;
-        }
-
-        // Wait briefly for file write locks to release
-        byte[] fileBytes = null;
-        for (int retry = 0; retry < 12; retry++)
-        {
-            try
-            {
-                fileBytes = await File.ReadAllBytesAsync(fullPath);
-                break;
-            }
-            catch (IOException)
-            {
-                await Task.Delay(60);
-            }
-            catch (Exception)
-            {
-                await Task.Delay(60);
-            }
-        }
-
-        if (fileBytes is null || fileBytes.Length < 8)
-        {
-            return;
-        }
-
-        if (IsEncrypted(fileBytes))
+        if (!ActiveProcessingFiles.TryAdd(normPath, 0))
         {
             return;
         }
 
         try
         {
-            // Extract metadata from the unencrypted image before encrypting, so .swarm.json can be preserved
-            string metaJson = null;
+            (bool isEnabled, string code) = GetActiveEncryptionState();
+            if (!isEnabled || string.IsNullOrWhiteSpace(code))
+            {
+                return;
+            }
+
+            string ext = Path.GetExtension(fullPath).ToLowerFast();
+
+            // If Session.StillSavingFiles has this file, await its task so we know the generation/encoding task has completed
+            string altPath = normPath.Replace('/', '\\');
+            if (Session.StillSavingFiles.TryGetValue(normPath, out Task<byte[]> saveTask) ||
+                Session.StillSavingFiles.TryGetValue(altPath, out saveTask) ||
+                Session.StillSavingFiles.TryGetValue(fullPath, out saveTask))
+            {
+                if (saveTask is not null && !saveTask.IsCompleted)
+                {
+                    try
+                    {
+                        await saveTask;
+                    }
+                    catch
+                    {
+                        // Ignore task errors here
+                    }
+                }
+            }
+
+            // Poll until file can be opened with exclusive access, size is stable, and image data is complete
+            byte[] fileBytes = null;
+            long lastLength = -1;
+            int stableCount = 0;
+
+            for (int attempt = 0; attempt < 40; attempt++)
+            {
+                try
+                {
+                    if (!File.Exists(fullPath))
+                    {
+                        await Task.Delay(100);
+                        continue;
+                    }
+
+                    FileInfo fi = new(fullPath);
+                    long currentLength = fi.Length;
+
+                    if (currentLength <= 0)
+                    {
+                        await Task.Delay(100);
+                        continue;
+                    }
+
+                    if (currentLength == lastLength)
+                    {
+                        stableCount++;
+                    }
+                    else
+                    {
+                        stableCount = 0;
+                        lastLength = currentLength;
+                    }
+
+                    // Check if file is already encrypted by inspecting the first 53 bytes
+                    byte[] headerCheck = new byte[HeaderSize];
+                    int bytesReadHeader = 0;
+                    using (FileStream fsHeader = new(fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    {
+                        bytesReadHeader = await fsHeader.ReadAsync(headerCheck.AsMemory(0, HeaderSize));
+                    }
+                    if (bytesReadHeader >= HeaderSize && IsEncrypted(headerCheck))
+                    {
+                        RecentlyEncryptedFiles[normPath] = Environment.TickCount64;
+                        return;
+                    }
+
+                    // Attempt exclusive read lock with FileShare.None.
+                    // This will fail with IOException if any process (such as File.WriteAllBytes) is currently writing to the file.
+                    byte[] readCandidate = null;
+                    try
+                    {
+                        using FileStream fsExclusive = new(fullPath, FileMode.Open, FileAccess.Read, FileShare.None);
+                        readCandidate = new byte[fsExclusive.Length];
+                        int totalRead = 0;
+                        while (totalRead < readCandidate.Length)
+                        {
+                            int r = await fsExclusive.ReadAsync(readCandidate.AsMemory(totalRead, readCandidate.Length - totalRead));
+                            if (r == 0)
+                            {
+                                break;
+                            }
+                            totalRead += r;
+                        }
+                    }
+                    catch (IOException)
+                    {
+                        // File is currently locked / being written by another thread or process
+                        await Task.Delay(100);
+                        continue;
+                    }
+
+                    if (readCandidate is not null && readCandidate.Length > 0)
+                    {
+                        if (IsEncrypted(readCandidate))
+                        {
+                            RecentlyEncryptedFiles[normPath] = Environment.TickCount64;
+                            return;
+                        }
+
+                        if (IsImageComplete(readCandidate, ext))
+                        {
+                            fileBytes = readCandidate;
+                            break;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logs.Debug($"[Swarmui-Image-Encriptor] Waiting for file completion '{fullPath}': {ex.Message}");
+                }
+
+                await Task.Delay(100);
+            }
+
+            if (fileBytes is null || fileBytes.Length < 64 || !IsImageComplete(fileBytes, ext))
+            {
+                Logs.Warning($"[Swarmui-Image-Encriptor] File '{fullPath}' could not be safely verified as complete. Skipping encryption to prevent corruption.");
+                return;
+            }
+
+            if (IsEncrypted(fileBytes))
+            {
+                RecentlyEncryptedFiles[normPath] = Environment.TickCount64;
+                return;
+            }
+
             try
             {
-                string ext = Path.GetExtension(fullPath).TrimStart('.').ToLowerFast();
-                metaJson = new Image(fileBytes, MediaType.GetByExtension(ext)).GetMetadata();
-            }
-            catch
-            {
-                // Metadata extraction fallback
-            }
+                // 1. Ensure preview thumbnail is created and cached in OutputMetadataTracker BEFORE encrypting on disk
+                try
+                {
+                    OutputMetadataTracker.GetOrCreatePreviewFor(fullPath.Replace('\\', '/'));
+                }
+                catch (Exception ex)
+                {
+                    Logs.Debug($"[Swarmui-Image-Encriptor] Preview generation hook: {ex.Message}");
+                }
 
-            byte[] encrypted = EncryptBytes(fileBytes, code.Trim());
-            RecentlyEncryptedFiles[normPath] = Environment.TickCount64;
-            await File.WriteAllBytesAsync(fullPath, encrypted);
-            Logs.Info($"[Swarmui-Image-Encriptor] Successfully encrypted output file on disk: '{fullPath}'");
+                // 2. Extract metadata from the unencrypted image before encrypting, so .swarm.json can be preserved
+                string metaJson = null;
+                try
+                {
+                    string extClean = ext.TrimStart('.').ToLowerFast();
+                    metaJson = new Image(fileBytes, MediaType.GetByExtension(extClean)).GetMetadata();
+                }
+                catch (Exception ex)
+                {
+                    Logs.Debug($"[Swarmui-Image-Encriptor] Metadata extraction fallback: {ex.Message}");
+                }
 
-            // Ensure .swarm.json metadata file is written with valid JSON so OutputMetadataTracker can read history without decoding the encrypted PNG
-            string jsonPath = Path.ChangeExtension(fullPath, ".swarm.json");
-            if (!string.IsNullOrWhiteSpace(metaJson) && !File.Exists(jsonPath))
+                // 3. Ensure .swarm.json metadata file is written with valid JSON so OutputMetadataTracker can read history without decoding the encrypted PNG
+                string jsonPath = Path.ChangeExtension(fullPath, ".swarm.json");
+                if (!string.IsNullOrWhiteSpace(metaJson) && !File.Exists(jsonPath))
+                {
+                    await File.WriteAllTextAsync(jsonPath, metaJson);
+                }
+
+                // 4. Encrypt the verified complete bytes
+                byte[] encrypted = EncryptBytes(fileBytes, code.Trim());
+
+                // Mark as recently encrypted before writing to prevent watcher echo
+                RecentlyEncryptedFiles[normPath] = Environment.TickCount64;
+
+                // Write with exclusive lock
+                using (FileStream fsOut = new(fullPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    await fsOut.WriteAsync(encrypted.AsMemory(0, encrypted.Length));
+                    await fsOut.FlushAsync();
+                }
+
+                Logs.Info($"[Swarmui-Image-Encriptor] Successfully encrypted output file on disk: '{fullPath}' ({fileBytes.Length} bytes -> {encrypted.Length} bytes)");
+            }
+            catch (Exception ex)
             {
-                await File.WriteAllTextAsync(jsonPath, metaJson);
+                RecentlyEncryptedFiles.TryRemove(normPath, out _);
+                Logs.Error($"[Swarmui-Image-Encriptor] Error encrypting file '{fullPath}': {ex.ReadableString()}");
             }
         }
-        catch (Exception ex)
+        finally
         {
-            Logs.Error($"[Swarmui-Image-Encriptor] Error encrypting file '{fullPath}': {ex.ReadableString()}");
+            ActiveProcessingFiles.TryRemove(normPath, out _);
         }
     }
 
@@ -470,33 +702,127 @@ public class SwarmuiImageEncriptorExtension : Extension
         return (GlobalEnabled, GlobalCode);
     }
 
-    /// <summary>Handles post-generation event to hook encryption parameters before saving to disk.</summary>
+    /// <summary>Calculates the next available unique file path for saving an output image according to user format settings.</summary>
+    public static string GetNextSavePath(User user, T2IParamInput input, int batchIndex, string extension)
+    {
+        string rawImagePath = user.BuildImageOutputPath(input, batchIndex);
+        string imagePath = rawImagePath.Replace("[number]", "1");
+        string fullPathNoExt = Path.GetFullPath(UserImageHistoryHelper.GetRealPathFor(user, $"{user.OutputDirectory}/{imagePath}"));
+        string pathFolder = imagePath.Contains('/') ? imagePath.BeforeLast('/') : "";
+        string folderRoute = Path.GetFullPath(UserImageHistoryHelper.GetRealPathFor(user, $"{user.OutputDirectory}/{pathFolder}"));
+        string fullPath = $"{fullPathNoExt}.{extension}";
+
+        lock (user.UserLock)
+        {
+            Directory.CreateDirectory(folderRoute);
+            HashSet<string> existingFiles = [.. Directory.EnumerateFiles(folderRoute).Union(Session.RecentlyBlockedFilenames.Keys.Where(f => f.StartsWith(folderRoute))).Select(f => f.BeforeLast('.'))];
+            int num = 0;
+            while (existingFiles.Contains(fullPathNoExt))
+            {
+                num++;
+                imagePath = rawImagePath.Contains("[number]") ? rawImagePath.Replace("[number]", $"{num}") : $"{rawImagePath}-{num}";
+                fullPathNoExt = Path.GetFullPath(UserImageHistoryHelper.GetRealPathFor(user, $"{user.OutputDirectory}/{imagePath}"));
+                fullPath = $"{fullPathNoExt}.{extension}";
+            }
+            Session.RecentlyBlockedFilenames[fullPath] = fullPath;
+        }
+
+        return fullPath;
+    }
+
+    /// <summary>Generates and stores the image preview thumbnail and metadata directly into LiteDB using in-memory bytes so unencrypted files never need to touch disk.</summary>
+    public static void PrecachePreviewAndMetadata(string fullPath, byte[] unencryptedData, string rawMetadata)
+    {
+        try
+        {
+            string normPath = fullPath.Replace('\\', '/');
+            string folder = normPath.BeforeAndAfterLast('/', out string filename);
+            if (!Program.ServerSettings.Metadata.ImageMetadataPerFolder)
+            {
+                filename = normPath;
+            }
+
+            OutputMetadataTracker.OutputDatabase db = OutputMetadataTracker.GetDatabaseForFolder(folder);
+            long timeNow = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+            byte[] thumbBytes = null;
+            try
+            {
+                using ISImage isImg = ISImage.Load(unencryptedData);
+                int maxDim = 256;
+                if (isImg.Width > maxDim || isImg.Height > maxDim)
+                {
+                    int newW = isImg.Width;
+                    int newH = isImg.Height;
+                    if (newW > newH)
+                    {
+                        newH = (int)((double)newH * maxDim / newW);
+                        newW = maxDim;
+                    }
+                    else
+                    {
+                        newW = (int)((double)newW * maxDim / newH);
+                        newH = maxDim;
+                    }
+                    isImg.Mutate(x => x.Resize(newW, newH));
+                }
+                using MemoryStream ms = new();
+                isImg.SaveAsJpeg(ms);
+                thumbBytes = ms.ToArray();
+            }
+            catch (Exception ex)
+            {
+                Logs.Debug($"[Swarmui-Image-Encriptor] Failed in-memory preview thumbnail: {ex.Message}");
+            }
+
+            if (thumbBytes is not null)
+            {
+                OutputMetadataTracker.OutputPreviewEntry previewEntry = new()
+                {
+                    FileName = filename,
+                    PreviewData = thumbBytes,
+                    SimplifiedData = null,
+                    LastVerified = timeNow,
+                    FileTime = timeNow
+                };
+                lock (db.Lock)
+                {
+                    db.Previews.Upsert(previewEntry);
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(rawMetadata))
+            {
+                OutputMetadataTracker.OutputMetadataEntry metaEntry = new()
+                {
+                    FileName = filename,
+                    Metadata = rawMetadata,
+                    LastVerified = timeNow,
+                    FileTime = timeNow
+                };
+                lock (db.Lock)
+                {
+                    db.Metadata.Upsert(metaEntry);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logs.Debug($"[Swarmui-Image-Encriptor] Failed to pre-cache metadata in LiteDB: {ex.ReadableString()}");
+        }
+    }
+
+    /// <summary>Handles post-generation event to intercept the generation in RAM and prevent raw unencrypted bytes from ever touching disk.</summary>
     public static void OnPostGenerate(T2IEngine.PostGenerationEventParams postParams)
     {
         try
         {
-            string code = null;
-            bool enabled = false;
-
-            if (postParams.UserInput.TryGet(EncryptionCodeParam, out string userCode) && !string.IsNullOrWhiteSpace(userCode))
+            (bool isEnabled, string code) = GetActiveEncryptionState(postParams.UserInput.SourceSession);
+            if (isEnabled && !string.IsNullOrWhiteSpace(code))
             {
-                code = userCode.Trim();
-                enabled = true;
-            }
-            else if (postParams.UserInput.SourceSession is not null && SessionSettings.TryGetValue(postParams.UserInput.SourceSession.ID, out (bool Enabled, string Code) sessData))
-            {
-                enabled = sessData.Enabled;
-                code = sessData.Code;
-            }
-            else
-            {
-                enabled = GlobalEnabled;
-                code = GlobalCode;
-            }
-
-            if (enabled && !string.IsNullOrWhiteSpace(code))
-            {
-                postParams.UserInput.ExtraMeta["encrypted_with"] = "AES-256-GCM";
+                // Instruct SwarmUI core to NOT save the raw unencrypted file to disk:
+                postParams.UserInput.Set(T2IParamTypes.DoNotSave, true);
+                postParams.UserInput.ExtraMeta["encrypted_with"] = "AES-256-GCM-RAM";
             }
         }
         catch (Exception ex)
@@ -505,7 +831,7 @@ public class SwarmuiImageEncriptorExtension : Extension
         }
     }
 
-    /// <summary>Handles post-batch event to verify all output images in the batch are encrypted.</summary>
+    /// <summary>Handles post-batch event to encrypt images directly in RAM and save them to disk as encrypted files, guaranteeing unencrypted bytes never touch disk.</summary>
     public static void OnPostBatch(T2IEngine.PostBatchEventParams batchParams)
     {
         try
@@ -516,9 +842,91 @@ public class SwarmuiImageEncriptorExtension : Extension
                 return;
             }
 
+            User user = batchParams.UserInput.SourceSession?.User ?? Program.Sessions.GetUser(SessionHandler.LocalUserID);
+            if (user is null || !user.Settings.SaveFiles)
+            {
+                return;
+            }
+
             Utilities.RunCheckedTask(async () =>
             {
-                await Task.Delay(250);
+                if (batchParams.Images is not null && batchParams.Images.Length > 0)
+                {
+                    for (int i = 0; i < batchParams.Images.Length; i++)
+                    {
+                        T2IEngine.ImageOutput img = batchParams.Images[i];
+                        if (img is null || img.File is null)
+                        {
+                            continue;
+                        }
+
+                        try
+                        {
+                            MediaFile finalFile = img.ActualFileTask is not null ? await img.ActualFileTask : img.File;
+                            if (finalFile is null || finalFile.RawData is null || finalFile.RawData.Length == 0)
+                            {
+                                continue;
+                            }
+
+                            string targetFormat = batchParams.UserInput.Get(T2IParamTypes.ImageFormat, user.Settings.FileFormat.ImageFormat);
+                            string extension;
+                            try
+                            {
+                                extension = ImageFile.ImageFormatToExtension(targetFormat);
+                            }
+                            catch
+                            {
+                                extension = "png";
+                            }
+                            if (finalFile.Type.MetaType != MediaMetaType.Image)
+                            {
+                                extension = finalFile.Type.Extension;
+                            }
+
+                            // Convert format or embed metadata in RAM if needed
+                            if (finalFile is ImageFile imgFile && (targetFormat != "png" || user.Settings.FileFormat.SaveMetadata))
+                            {
+                                try
+                                {
+                                    string rawMeta = user.Settings.FileFormat.SaveMetadata ? batchParams.UserInput.GenRawMetadata() : null;
+                                    ImageFile converted = imgFile.ConvertTo(targetFormat, rawMeta, user.Settings.FileFormat.DPI, Math.Clamp(user.Settings.FileFormat.ImageQuality, 1, 100), user.Settings.FileFormat.StealthMetadata);
+                                    if (converted is not null)
+                                    {
+                                        finalFile = converted;
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    Logs.Debug($"[Swarmui-Image-Encriptor] Image format conversion in RAM: {ex.Message}");
+                                }
+                            }
+
+                            string fullPath = GetNextSavePath(user, batchParams.UserInput, i, extension);
+                            string normPath = Path.GetFullPath(fullPath).Replace('\\', '/');
+
+                            // Pre-cache preview and metadata directly in LiteDB using in-memory bytes
+                            PrecachePreviewAndMetadata(fullPath, finalFile.RawData, batchParams.UserInput.GenRawMetadata());
+
+                            // Encrypt in RAM:
+                            byte[] encrypted = EncryptBytes(finalFile.RawData, code.Trim());
+
+                            // Mark as recently encrypted so watcher ignores it:
+                            RecentlyEncryptedFiles[normPath] = Environment.TickCount64;
+
+                            // Write directly to disk (never touched disk in raw form):
+                            await File.WriteAllBytesAsync(fullPath, encrypted);
+
+                            Logs.Info($"[Swarmui-Image-Encriptor] 100% RAM-encrypted and saved directly to disk: '{fullPath}' ({finalFile.RawData.Length} bytes -> {encrypted.Length} bytes)");
+                        }
+                        catch (Exception ex)
+                        {
+                            Logs.Error($"[Swarmui-Image-Encriptor] Error saving RAM-encrypted image {i}: {ex.ReadableString()}");
+                        }
+                    }
+                }
+
+                // Fallback sweep for any stray unencrypted images
+                await Task.Delay(1000);
                 string userDir = batchParams.UserInput.SourceSession is not null ? UserImageHistoryHelper.GetRealPathFor(batchParams.UserInput.SourceSession.User, batchParams.UserInput.SourceSession.User.OutputDirectory) : null;
                 userDir ??= Utilities.CombinePathWithAbsolute(Environment.CurrentDirectory, Program.ServerSettings.Paths.OutputPath);
 
@@ -541,7 +949,7 @@ public class SwarmuiImageEncriptorExtension : Extension
         }
         catch (Exception ex)
         {
-            Logs.Error($"[Swarmui-Image-Encriptor] Error during post-batch sweep: {ex.ReadableString()}");
+            Logs.Error($"[Swarmui-Image-Encriptor] Error during post-batch RAM encryption: {ex.ReadableString()}");
         }
     }
 
