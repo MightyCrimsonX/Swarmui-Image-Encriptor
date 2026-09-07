@@ -1,145 +1,140 @@
-<div align="center">
+# Swarmui-Image-Encriptor
 
-# 🔒 Image Encryptor Extension for SwarmUI
+A security extension for [SwarmUI](https://github.com/mcmonkeyprojects/SwarmUI) that encrypts generated media directly in memory using authenticated **AES-256-GCM** before writing to disk, while keeping images fully visible and interactive in the web interface.
 
-**A modular, high-security disk encryption extension for [SwarmUI](https://github.com/mcmonkeyprojects/SwarmUI).**
-
-[![SwarmUI Compatible](https://img.shields.io/badge/SwarmUI-Extension-purple.svg?style=for-the-badge&logo=github)](https://github.com/mcmonkeyprojects/SwarmUI)
-[![Encryption](https://img.shields.io/badge/AES--256--GCM-Authenticated-blue.svg?style=for-the-badge&logo=shield)](https://en.wikipedia.org/wiki/Galois/Counter_Mode)
-[![Key Derivation](https://img.shields.io/badge/PBKDF2-100k%20Iterations-green.svg?style=for-the-badge)](https://en.wikipedia.org/wiki/PBKDF2)
-[![Vibe Coded](https://img.shields.io/badge/100%25-Vibe%20Coded-ff69b4.svg?style=for-the-badge&logo=sparkles)](#-vibe-coded)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](LICENSE)
-
-<br />
-
-> ⚡ **100% Vibe Coded** — Built via AI vibe coding, thoroughly reviewed and battle-tested by a human developer.
-
-</div>
+[![SwarmUI Compatible](https://img.shields.io/badge/SwarmUI-Extension-4b32c3.svg)](https://github.com/mcmonkeyprojects/SwarmUI)
+[![Encryption](https://img.shields.io/badge/Cipher-AES--256--GCM-0052cc.svg)](https://en.wikipedia.org/wiki/Galois/Counter_Mode)
+[![KDF](https://img.shields.io/badge/KDF-PBKDF2--SHA256%20(100k)-00875a.svg)](https://en.wikipedia.org/wiki/PBKDF2)
+[![License: MIT](https://img.shields.io/badge/License-MIT-gray.svg)](LICENSE)
 
 ---
 
-## 📖 Overview
+## Overview
 
-**Image Encryptor** seamlessly integrates into SwarmUI to protect generated images directly at the disk level. When active, generated outputs are instantly encrypted using authenticated **AES-256-GCM** encryption before saving to your output folder, while remaining fully visible and interactive in the SwarmUI web viewport.
+In multi-tenant, cloud-hosted, or shared execution environments (such as Kaggle or Google Colab), generated files written in raw format to the local filesystem are exposed to host-level scanners, file indexing jobs, or unauthorized inspection.
 
-> [!NOTE]
-> Images generated during an active session render normally in your browser's viewport and batch strip. On disk (in `Output/`), files are securely scrambled into encrypted binary format (`.enc` or encrypted `.png`).
-
----
-
-## ✨ Features
-
-- 🔒 **Real-Time Disk Encryption**: Automatic, transparent encryption of newly generated images upon saving to disk.
-- 🎚️ **Instant Toggle**: Dedicated switch in the UI to enable or disable encryption on-the-fly.
-- 👁️ **Seamless UI Viewing**: Generated images display live in the SwarmUI viewport without exposing unencrypted files on disk.
-- 🎛️ **Integrated Sidebar Tab (`🔒 Encryptor`)**: Positioned right next to the `Inputs` tab for fast access:
-  - **Main Toggle**: Turn encryption ON or OFF effortlessly.
-  - **Secret Passphrase / PIN Input**: Masked password field supporting custom passphrases or numeric PINs.
-  - **Interactive Touch Keypad**: On-screen 0-9 keypad designed for quick mouse or touch entry.
-  - **Random PIN Generator**: One-click generation of secure 8-digit random PINs.
-  - **Real-Time Status Indicator**:
-    - 🟢 **Encryption Active (AES-256)** — Encryption enabled with valid secret key set.
-    - 🟡 **Enabled (Enter Code or PIN)** — Encryption enabled, waiting for secret key input.
-    - ⚪ **Encryption Disabled** — Encryption turned OFF (standard saving).
-  - **Drag & Drop Decryptor**: Built-in dropzone to instantly decrypt and view `.png`/`.enc` encrypted files directly inside the browser.
+**Swarmui-Image-Encriptor** intercepts generation outputs directly in memory (RAM). When encryption is active, raw unencrypted media never touches the host storage: the data is converted, preview-indexed, encrypted with AES-256-GCM, and written to disk purely as binary ciphertext. When accessed through the SwarmUI web interface, an integrated HTTP middleware decrypts payloads on-the-fly in response to authorized sessions.
 
 ---
 
-## 🛠️ Technical Specifications
+## Architecture & Data Flow
 
-This extension enforces enterprise-grade cryptographic standards to ensure data integrity and confidentiality:
+```
+[ Stable Diffusion / ComfyUI Pipeline ]
+                   │
+                   ▼ (In-Memory Image Buffer)
+         [ PostGenerate Hook ]
+                   │
+                   ├──> WebSocket Live Stream ──> Web Client (Rendered in Viewport)
+                   │
+                   ├──> Pre-cache Thumbnail & Metadata ──> Internal LiteDB (swarm_metadata.ldb)
+                   │
+                   ▼
+         [ In-Memory AES-256-GCM Encryption ]
+                   │
+                   ▼ (Only Ciphertext Touches Storage)
+         [ Disk Write: Output/YYYY-MM-DD/filename.png ] (SWARMENC Header + Ciphertext)
+```
 
-| Parameter | Specification | Description |
+1. **Zero-Disk Exposure (`DoNotSave` Interception)**: The extension signals the SwarmUI generation engine to bypass raw disk saving. The browser receives the live result directly via WebSocket.
+2. **Metadata & Preview Pre-caching**: Generation parameters (prompt, seed, model, etc.) and preview thumbnails are stored directly into SwarmUI's internal SQLite/LiteDB database (`swarm_metadata.ldb`). No plaintext `.swarm.json` metadata files with sensitive prompts are left on disk.
+3. **In-Memory Encryption**: Image payloads are transformed and encrypted in RAM using AES-256-GCM with a unique salt and nonce per file.
+4. **On-the-Fly Decryption Middleware**: When requesting an image (`/View/...` or `/Output/...`), ASP.NET Core middleware decrypts the file stream in memory for the active authenticated session.
+5. **Fallback Watcher with Format Validation**: A background `FileSystemWatcher` acts as a secondary layer for files emitted outside the standard generation path. It enforces atomic access locks (`FileShare.None`) and format-specific boundary verification (PNG `IEND`, JPEG `EOI`, WebP `RIFF`) before encryption to prevent partial writes or truncated files.
+
+---
+
+## Technical Specifications
+
+| Parameter | Value | Details |
 | :--- | :--- | :--- |
-| **Cipher Algorithm** | `AES-256-GCM` | Authenticated Galois/Counter Mode (confidentiality & tamper protection) |
-| **Key Derivation** | `PBKDF2` | HMAC-SHA256 with **100,000 iterations** |
-| **Salt** | `16 Bytes` | Cryptographically secure random salt generated per file |
-| **Nonce / IV** | `12 Bytes` | Unique random initialization vector generated per file |
-| **Auth Tag** | `16 Bytes` | Ensures files cannot be modified without detection |
+| **Cipher** | `AES-256-GCM` | Authenticated Galois/Counter Mode (confidentiality + integrity verification) |
+| **Key Derivation** | `PBKDF2-HMAC-SHA256` | 100,000 iterations |
+| **Salt Length** | `16 bytes` | CSPRNG-generated (`RandomNumberGenerator.GetBytes`) per file |
+| **Nonce (IV)** | `12 bytes` | Unique CSPRNG vector per file |
+| **Auth Tag** | `16 bytes` | GCM authentication tag for tamper detection |
+| **Header Overhead** | `53 bytes` | Standardized binary header prefix |
 
-### 📦 Binary Header Format
+### Binary File Layout (`SWARMENC`)
 
-Encrypted files created by this extension contain a standardized 53-byte binary header followed by the encrypted ciphertext:
+Encrypted output files adopt the following binary structure:
 
 ```
-+------------------+---------+--------------------+--------------------+--------------------+--------------------+
-| Magic Bytes      | Version | PBKDF2 Salt        | AES-GCM Nonce (IV) | Auth Tag           | Ciphertext         |
-| "SWARMENC"       | (0x01)  | (16 bytes)         | (12 bytes)         | (16 bytes)         | (Variable)         |
-| Bytes 0..7       | Byte 8  | Bytes 9..24        | Bytes 25..36       | Bytes 37..52       | Bytes 53..End      |
-+------------------+---------+--------------------+--------------------+--------------------+--------------------+
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                 Magic Bytes: "SWARMENC" (8 B)                 |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| Version (0x01)|           PBKDF2 Salt (Bytes 0..14)           |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  Salt (B15)   |          AES-GCM Nonce / IV (12 B)            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    GCM Auth Tag (16 B)                        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    Encrypted Payload ...                      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
-
-| Offset (Bytes) | Field Name | Data / Type | Purpose |
-| :---: | :--- | :--- | :--- |
-| `0 .. 7` | **Magic Header** | `SWARMENC` (`0x53 0x57 0x41 0x52 0x4D 0x45 0x4E 0x43`) | Identifies file format |
-| `8` | **Version** | `0x01` | Header format version identifier |
-| `9 .. 24` | **Salt** | 16-byte random byte array | Salt for PBKDF2 key derivation |
-| `25 .. 36` | **Nonce (IV)** | 12-byte random byte array | AES-GCM initialization vector |
-| `37 .. 52` | **Auth Tag** | 16-byte authentication tag | Verification tag for tamper protection |
-| `53 .. end` | **Ciphertext** | Encrypted image payload | Standard image data encrypted with AES-256-GCM |
 
 ---
 
-## 🚀 Installation & Usage
+## Features
 
-### Installation
+- **In-RAM Encryption Pipeline**: Prevents unencrypted image data and plaintext metadata files from ever reaching the storage medium.
+- **Transparent Web UI Operation**: Generations, history browsing and prompt inspection ("Reuse Parameters") operate normally through automated in-memory decryption.
+- **Dedicated Sidebar Interface (`Encryptor` Tab)**:
+  - Master toggle switch (enabled by default).
+  - Secret passcode/PIN input field with visibility toggling.
+  - Interactive on-screen numeric keypad for touch or mouse input.
+  - One-click random 8-digit PIN generator.
+  - Client-side drag-and-drop file decryptor for inspecting or recovering files offline.
+- **Dual-Layer State Persistence**:
+  - Server-side: Stored persistently in `Data/image_encryptor_settings.json` across process restarts.
+  - Client-side: Synced with browser `localStorage` for seamless multi-tab sessions.
+- **Truncation Prevention**: File-locking guards and end-of-stream markers guarantee that files are never processed or corrupted prematurely.
 
-1. Copy or clone the `ImageEncryptor` extension folder into your SwarmUI installation under:
-   ```text
-   SwarmUI/src/Extensions/ImageEncryptor/
+---
+
+## Installation
+
+1. Place the extension directory into your SwarmUI installation:
+   ```bash
+   # From your SwarmUI root directory:
+   git clone <repo-url> src/Extensions/Swarmui-Image-Encriptor
    ```
 
-2. Ensure the directory structure matches:
+2. Confirm the directory structure:
    ```text
-   SwarmUI/src/Extensions/ImageEncryptor/
+   src/Extensions/Swarmui-Image-Encriptor/
    ├── Assets/
-   │   ├── image_encryptor.css
-   │   └── image_encryptor.js
-   ├── ImageEncryptor.csproj
-   └── ImageEncryptorExtension.cs
+   │   ├── image_encriptor.css
+   │   └── image_encriptor.js
+   ├── README.md
+   ├── Swarmui-Image-Encriptor.csproj
+   └── SwarmuiImageEncriptorExtension.cs
    ```
 
-3. Launch SwarmUI using your standard startup script (`launch-dev.bat`, `launch-windows.bat`, or `launch-linux.sh`).
-
-### Usage Guide
-
-1. Open the SwarmUI Web Interface.
-2. Select the **🔒 Encryptor** tab on the left sidebar (located next to `Inputs`).
-3. Switch **Enable Disk Encryption** to **ON**.
-4. Enter your desired **Secret Passphrase/PIN**, or click **Generate Random PIN**.
-5. Start generating images:
-   - In SwarmUI, preview images render normally.
-   - On disk in `Output/`, saved images are safely encrypted with AES-256-GCM.
-6. To decrypt an encrypted image offline or from disk, drag and drop the `.png` or `.enc` file into the **Drag & Drop Decryptor** area within the Encryptor tab.
-
-> [!IMPORTANT]
-> Make sure to remember or safely store your secret PIN/passphrase! Files encrypted with AES-256-GCM cannot be recovered without the original key.
+3. Launch or restart SwarmUI. The extension will automatically build and register on startup:
+   ```bash
+   ./launch-windows.bat  # Windows
+   ./launch-linux.sh    # Linux
+   ```
 
 ---
 
-## 📂 Project Structure
+## Usage
 
-```
-Swarmui-Image-Encriptor/
-└── ImageEncryptor/
-    ├── Assets/
-    │   ├── image_encryptor.css  # UI styling for sidebar tab & keypad
-    │   └── image_encryptor.js   # Client-side decryptor & interactive logic
-    ├── ImageEncryptor.csproj    # C# extension project reference
-    └── ImageEncryptorExtension.cs # C# backend extension hooks & AES-GCM encryption logic
-```
+1. Open the SwarmUI web interface.
+2. Navigate to the **Encryptor** tab in the left sidebar (adjacent to `Inputs`).
+3. Ensure **Enable Disk Encryption** is checked (enabled by default with initial passcode `1234`).
+4. Set your custom passphrase or PIN. Any change automatically persists on disk and in browser storage.
+5. Generate images as usual. Outputs will appear normally in the generation canvas and history, while the underlying files stored in `Output/` remain encrypted.
+6. **Offline Decryption**: Drag any `.png`, `.jpg`, or `.webp` encrypted file into the dropzone in the Encryptor tab to decrypt and download it directly in the client.
 
----
-
-## 🛡️ Security Considerations
-
-- **Authenticated Encryption**: Uses AES-GCM to prevent silent payload modification or corruption.
-- **Key Isolation**: Each file uses a unique random salt and nonce, preventing rainbow table or replay attacks.
-- **In-Memory Safety**: Passphrases are processed on-demand and not stored in plaintext on disk.
+> [!WARNING]
+> Keep a safe record of your encryption passcode. Data encrypted with AES-256-GCM cannot be recovered if the passcode is lost.
 
 ---
 
-## 📜 License
+## License
 
-Distributed under the MIT License. See `LICENSE` for more information.
-
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
