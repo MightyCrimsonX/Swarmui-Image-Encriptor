@@ -69,14 +69,25 @@ Encrypted files created by this extension contain a standardized 53-byte binary 
 +------------------+---------+--------------------+--------------------+--------------------+--------------------+
 ```
 
-| Offset (Bytes) | Field Name | Data / Type | Purpose |
-| :---: | :--- | :--- | :--- |
-| `0 .. 7` | **Magic Header** | `SWARMENC` (`0x53 0x57 0x41 0x52 0x4D 0x45 0x4E 0x43`) | Identifies file format |
-| `8` | **Version** | `0x01` | Header format version identifier |
-| `9 .. 24` | **Salt** | 16-byte random byte array | Salt for PBKDF2 key derivation |
-| `25 .. 36` | **Nonce (IV)** | 12-byte random byte array | AES-GCM initialization vector |
-| `37 .. 52` | **Auth Tag** | 16-byte authentication tag | Verification tag for tamper protection |
-| `53 .. end` | **Ciphertext** | Encrypted image payload | Standard image data encrypted with AES-256-GCM |
+---
+
+## Features
+
+- **In-RAM Encryption Pipeline**: Prevents unencrypted image data and plaintext metadata files from ever reaching the storage medium.
+- **Embedded Metadata on Download**: Downloaded images (via right-click or SwarmUI's Download button) preserve embedded generation metadata (`parameters` PNG chunk / EXIF), allowing full parameter reuse when dragged back into SwarmUI.
+- **Drag-and-Drop Auto-Decryption**: Dropping any image (whether a downloaded image or a raw encrypted `.png`/`.enc` file from disk) onto the SwarmUI workspace automatically decrypts it in RAM and loads all generation parameters seamlessly.
+- **Full Grid & Batch Encryption**: Comprehensive protection for both automated multi-image batch mini-grids and dedicated Grid Generator extension outputs, ensuring both individual cell images and composite grid files are encrypted on disk.
+- **Transparent Web UI Operation**: Generations, history browsing, and prompt inspection operate normally through automated in-memory decryption.
+- **Dedicated Sidebar Interface (`Encryptor` Tab)**:
+  - Master toggle switch (enabled by default).
+  - Secret passcode/PIN input field with visibility toggling.
+  - Interactive on-screen numeric keypad for touch or mouse input.
+  - One-click random 8-digit PIN generator.
+  - Client-side drag-and-drop file decryptor for inspecting or recovering files offline.
+- **Dual-Layer State Persistence**:
+  - Server-side: Stored persistently in `Data/image_encryptor_settings.json` across process restarts.
+  - Client-side: Synced with browser `localStorage` for seamless multi-tab sessions.
+- **Truncation Prevention**: File-locking guards and end-of-stream markers guarantee that files are never processed or corrupted prematurely.
 
 ---
 

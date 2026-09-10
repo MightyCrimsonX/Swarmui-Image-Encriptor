@@ -25,6 +25,8 @@ class SwarmuiImageEncriptorHelper {
 
         this.injectSidebarTab();
         this.hookGenerationInputs();
+        this.hookDropHandler();
+        this.hookDownloadButtons();
         this.loadSavedState();
     }
 
@@ -556,6 +558,105 @@ class SwarmuiImageEncriptorHelper {
             console.error('[Swarmui-Image-Encriptor] Decryption error:', err);
             alert('Decryption failed: Incorrect passcode / PIN or corrupted file.');
         }
+    }
+
+    /**
+     * Hooks window-level drag & drop events to automatically decrypt encrypted images dropped anywhere onto SwarmUI.
+     */
+    hookDropHandler() {
+        window.addEventListener('drop', async (e) => {
+            if (!e.dataTransfer || !e.dataTransfer.files || e.dataTransfer.files.length == 0) {
+                return;
+            }
+            let file = e.dataTransfer.files[0];
+            try {
+                let slice = file.slice(0, 53);
+                let buf = await slice.arrayBuffer();
+                if (!this.isBufferEncrypted(buf)) {
+                    return;
+                }
+
+                // File is encrypted with SwarmEnc header, intercept before internal handlers
+                e.preventDefault();
+                e.stopPropagation();
+                e.stopImmediatePropagation();
+
+                let code = this.currentCode;
+                if (!code) {
+                    if (typeof showError == 'function') {
+                        showError('Dropped image is encrypted. Please enter your secret encryption passcode or PIN in the Encryptor tab.');
+                    }
+                    else {
+                        alert('Dropped image is encrypted. Please enter your secret encryption passcode or PIN in the Encryptor tab.');
+                    }
+                    return;
+                }
+
+                let fullBuf = await file.arrayBuffer();
+                let decryptedBuf;
+                try {
+                    decryptedBuf = await this.decryptBuffer(fullBuf, code);
+                }
+                catch (err) {
+                    console.error('[Swarmui-Image-Encriptor] Decrypt drop error:', err);
+                    if (typeof showError == 'function') {
+                        showError('Failed to decrypt dropped image: Incorrect passcode / PIN or corrupted file.');
+                    }
+                    else {
+                        alert('Failed to decrypt dropped image: Incorrect passcode / PIN or corrupted file.');
+                    }
+                    return;
+                }
+
+                let u8 = new Uint8Array(decryptedBuf);
+                let mime = 'image/png';
+                if (u8.length > 3 && u8[0] == 0xFF && u8[1] == 0xD8 && u8[2] == 0xFF) {
+                    mime = 'image/jpeg';
+                }
+                else if (u8.length > 12 && u8[0] == 0x52 && u8[1] == 0x49 && u8[2] == 0x46 && u8[3] == 0x46) {
+                    mime = 'image/webp';
+                }
+
+                let blob = new Blob([decryptedBuf], { type: mime });
+                let reader = new FileReader();
+                reader.onload = (re) => {
+                    let dataUrl = re.target.result;
+                    if (typeof parseMetadata == 'function') {
+                        parseMetadata(dataUrl, (data, metadata) => {
+                            if (typeof setCurrentImage == 'function') {
+                                setCurrentImage(data, metadata);
+                            }
+                        });
+                    }
+                    else if (typeof setCurrentImage == 'function') {
+                        setCurrentImage(dataUrl, null);
+                    }
+                };
+                reader.readAsDataURL(blob);
+            }
+            catch (err) {
+                console.error('[Swarmui-Image-Encriptor] Drop hook error:', err);
+            }
+        }, true);
+    }
+
+    /**
+     * Hooks clicks on download buttons to give data URL downloads a clean timestamped filename.
+     */
+    hookDownloadButtons() {
+        document.addEventListener('click', (e) => {
+            let target = e.target.closest('a[download]');
+            if (target && target.href && target.href.startsWith('data:image/')) {
+                let currentDownload = target.getAttribute('download');
+                if (!currentDownload || currentDownload == '') {
+                    let ext = target.href.startsWith('data:image/jpeg') ? 'jpg' : (target.href.startsWith('data:image/webp') ? 'webp' : 'png');
+                    let now = new Date();
+                    let pad = (n) => `${n}`.padStart(2, '0');
+                    let timeStr = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+                    target.setAttribute('download', `SwarmUI_${timeStr}.${ext}`);
+                }
+            }
+        }, true);
     }
 
     /**

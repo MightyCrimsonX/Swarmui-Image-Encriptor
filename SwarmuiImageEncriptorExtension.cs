@@ -496,7 +496,15 @@ public class SwarmuiImageEncriptorExtension : Extension
 
             if (enabled && !string.IsNullOrWhiteSpace(code))
             {
-                postParams.UserInput.ExtraMeta["encrypted_with"] = "AES-256-GCM";
+                // Instruct SwarmUI core to NOT save the raw unencrypted file to disk:
+                postParams.UserInput.Set(T2IParamTypes.DoNotSave, true);
+                postParams.UserInput.ExtraMeta["encrypted_with"] = "AES-256-GCM-RAM";
+
+                // Ensure SwarmUI embeds metadata and reformats transient images so the WebSocket data URL has embedded metadata:
+                if (postParams.UserInput.SourceSession?.User?.Settings?.FileFormat is not null)
+                {
+                    postParams.UserInput.SourceSession.User.Settings.FileFormat.ReformatTransientImages = true;
+                }
             }
         }
         catch (Exception ex)
@@ -518,25 +526,107 @@ public class SwarmuiImageEncriptorExtension : Extension
 
             Utilities.RunCheckedTask(async () =>
             {
-                await Task.Delay(250);
-                string userDir = batchParams.UserInput.SourceSession is not null ? UserImageHistoryHelper.GetRealPathFor(batchParams.UserInput.SourceSession.User, batchParams.UserInput.SourceSession.User.OutputDirectory) : null;
-                userDir ??= Utilities.CombinePathWithAbsolute(Environment.CurrentDirectory, Program.ServerSettings.Paths.OutputPath);
-
-                if (Directory.Exists(userDir))
+                if (batchParams.Images is not null && batchParams.Images.Length > 0)
                 {
-                    DateTime threshold = DateTime.UtcNow.AddMinutes(-2);
-                    foreach (string file in Directory.EnumerateFiles(userDir, "*.*", SearchOption.AllDirectories))
+                    for (int i = 0; i < batchParams.Images.Length; i++)
                     {
-                        string ext = Path.GetExtension(file).ToLowerFast();
-                        if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp")
+                        T2IEngine.ImageOutput img = batchParams.Images[i];
+                        if (img is null || img.File is null)
                         {
-                            if (File.GetLastWriteTimeUtc(file) >= threshold)
+                            continue;
+                        }
+
+                        try
+                        {
+                            MediaFile finalFile = img.ActualFileTask is not null ? await img.ActualFileTask : img.File;
+                            if (finalFile is null || finalFile.RawData is null || finalFile.RawData.Length == 0)
                             {
-                                await ProcessFileForEncryption(file);
+                                continue;
+                            }
+
+                            string targetFormat = batchParams.UserInput.Get(T2IParamTypes.ImageFormat, user.Settings.FileFormat.ImageFormat).ToUpperInvariant();
+                            string extension;
+                            try
+                            {
+                                extension = ImageFile.ImageFormatToExtension(targetFormat);
+                            }
+                            catch
+                            {
+                                extension = targetFormat.ToLowerFast();
+                            }
+                            if (finalFile.Type.MetaType != MediaMetaType.Image)
+                            {
+                                extension = finalFile.Type.Extension;
+                            }
+
+                            // Convert format or embed metadata in RAM if needed
+                            if (finalFile is ImageFile imgFile && (user.Settings.FileFormat.SaveMetadata || targetFormat != "PNG"))
+                            {
+                                try
+                                {
+                                    string rawMeta = user.Settings.FileFormat.SaveMetadata ? batchParams.UserInput.GenRawMetadata() : null;
+                                    ImageFile converted = imgFile.ConvertTo(targetFormat, rawMeta, user.Settings.FileFormat.DPI, Math.Clamp(user.Settings.FileFormat.ImageQuality, 1, 100), user.Settings.FileFormat.StealthMetadata);
+                                    if (converted is not null)
+                                    {
+                                        finalFile = converted;
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    Logs.Debug($"[Swarmui-Image-Encriptor] Image format conversion in RAM: {ex.Message}");
+                                }
+                            }
+
+                            string fullPath = GetNextSavePath(user, batchParams.UserInput, i, extension);
+                            string normPath = Path.GetFullPath(fullPath).Replace('\\', '/');
+
+                            // Pre-cache preview and metadata directly in LiteDB using in-memory bytes
+                            PrecachePreviewAndMetadata(fullPath, finalFile.RawData, batchParams.UserInput.GenRawMetadata());
+
+                            // Encrypt in RAM:
+                            byte[] encrypted = EncryptBytes(finalFile.RawData, code.Trim());
+
+                            // Mark as recently encrypted so watcher ignores it:
+                            RecentlyEncryptedFiles[normPath] = Environment.TickCount64;
+
+                            // Write directly to disk (never touched disk in raw form):
+                            await File.WriteAllBytesAsync(fullPath, encrypted);
+
+                            Logs.Info($"[Swarmui-Image-Encriptor] 100% RAM-encrypted and saved directly to disk: '{fullPath}' ({finalFile.RawData.Length} bytes -> {encrypted.Length} bytes)");
+                        }
+                        catch (Exception ex)
+                        {
+                            Logs.Error($"[Swarmui-Image-Encriptor] Error saving RAM-encrypted image {i}: {ex.ReadableString()}");
+                        }
+                    }
+                }
+
+                // Immediate and delayed sweep for any stray unencrypted images (e.g. composite mini-grids or external grid outputs)
+                async Task SweepDirectoryForGrids()
+                {
+                    string userDir = batchParams.UserInput.SourceSession is not null ? UserImageHistoryHelper.GetRealPathFor(batchParams.UserInput.SourceSession.User, batchParams.UserInput.SourceSession.User.OutputDirectory) : null;
+                    userDir ??= Utilities.CombinePathWithAbsolute(Environment.CurrentDirectory, Program.ServerSettings.Paths.OutputPath);
+
+                    if (Directory.Exists(userDir))
+                    {
+                        DateTime threshold = DateTime.UtcNow.AddMinutes(-2);
+                        foreach (string file in Directory.EnumerateFiles(userDir, "*.*", SearchOption.AllDirectories))
+                        {
+                            string ext = Path.GetExtension(file).ToLowerFast();
+                            if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp")
+                            {
+                                if (File.GetLastWriteTimeUtc(file) >= threshold)
+                                {
+                                    await ProcessFileForEncryption(file);
+                                }
                             }
                         }
                     }
                 }
+
+                await SweepDirectoryForGrids();
+                await Task.Delay(1000);
+                await SweepDirectoryForGrids();
             });
         }
         catch (Exception ex)
