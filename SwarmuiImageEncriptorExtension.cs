@@ -823,6 +823,12 @@ public class SwarmuiImageEncriptorExtension : Extension
                 // Instruct SwarmUI core to NOT save the raw unencrypted file to disk:
                 postParams.UserInput.Set(T2IParamTypes.DoNotSave, true);
                 postParams.UserInput.ExtraMeta["encrypted_with"] = "AES-256-GCM-RAM";
+
+                // Ensure SwarmUI embeds metadata and reformats transient images so the WebSocket data URL has embedded metadata:
+                if (postParams.UserInput.SourceSession?.User?.Settings?.FileFormat is not null)
+                {
+                    postParams.UserInput.SourceSession.User.Settings.FileFormat.ReformatTransientImages = true;
+                }
             }
         }
         catch (Exception ex)
@@ -868,7 +874,7 @@ public class SwarmuiImageEncriptorExtension : Extension
                                 continue;
                             }
 
-                            string targetFormat = batchParams.UserInput.Get(T2IParamTypes.ImageFormat, user.Settings.FileFormat.ImageFormat);
+                            string targetFormat = batchParams.UserInput.Get(T2IParamTypes.ImageFormat, user.Settings.FileFormat.ImageFormat).ToUpperInvariant();
                             string extension;
                             try
                             {
@@ -876,7 +882,7 @@ public class SwarmuiImageEncriptorExtension : Extension
                             }
                             catch
                             {
-                                extension = "png";
+                                extension = targetFormat.ToLowerFast();
                             }
                             if (finalFile.Type.MetaType != MediaMetaType.Image)
                             {
@@ -884,7 +890,7 @@ public class SwarmuiImageEncriptorExtension : Extension
                             }
 
                             // Convert format or embed metadata in RAM if needed
-                            if (finalFile is ImageFile imgFile && (targetFormat != "png" || user.Settings.FileFormat.SaveMetadata))
+                            if (finalFile is ImageFile imgFile && (user.Settings.FileFormat.SaveMetadata || targetFormat != "PNG"))
                             {
                                 try
                                 {
@@ -925,36 +931,45 @@ public class SwarmuiImageEncriptorExtension : Extension
                     }
                 }
 
-                // Fallback sweep for any stray unencrypted images
+                // Immediate and delayed sweep for any stray unencrypted images (e.g. composite mini-grids or external grid outputs)
+                await SweepOutputDirectoryForEncryption(batchParams.UserInput.SourceSession);
                 await Task.Delay(1000);
-                string userDir = batchParams.UserInput.SourceSession is not null ? UserImageHistoryHelper.GetRealPathFor(batchParams.UserInput.SourceSession.User, batchParams.UserInput.SourceSession.User.OutputDirectory) : null;
-                userDir ??= Utilities.CombinePathWithAbsolute(Environment.CurrentDirectory, Program.ServerSettings.Paths.OutputPath);
-
-                    if (Directory.Exists(userDir))
-                    {
-                        DateTime threshold = DateTime.UtcNow.AddMinutes(-2);
-                        foreach (string file in Directory.EnumerateFiles(userDir, "*.*", SearchOption.AllDirectories))
-                        {
-                            string ext = Path.GetExtension(file).ToLowerFast();
-                            if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp")
-                            {
-                                if (File.GetLastWriteTimeUtc(file) >= threshold)
-                                {
-                                    await ProcessFileForEncryption(file);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                await SweepDirectoryForGrids();
-                await Task.Delay(1000);
-                await SweepDirectoryForGrids();
+                await SweepOutputDirectoryForEncryption(batchParams.UserInput.SourceSession);
             });
         }
         catch (Exception ex)
         {
             Logs.Error($"[Swarmui-Image-Encriptor] Error during post-batch RAM encryption: {ex.ReadableString()}");
+        }
+    }
+
+    /// <summary>Sweeps the output directory recursively to encrypt any unencrypted images (such as grids or batch composites) created in the last few minutes.</summary>
+    public static async Task SweepOutputDirectoryForEncryption(Session session)
+    {
+        try
+        {
+            string userDir = session is not null ? UserImageHistoryHelper.GetRealPathFor(session.User, session.User.OutputDirectory) : null;
+            userDir ??= Utilities.CombinePathWithAbsolute(Environment.CurrentDirectory, Program.ServerSettings.Paths.OutputPath);
+
+            if (Directory.Exists(userDir))
+            {
+                DateTime threshold = DateTime.UtcNow.AddMinutes(-2);
+                foreach (string file in Directory.EnumerateFiles(userDir, "*.*", SearchOption.AllDirectories))
+                {
+                    string ext = Path.GetExtension(file).ToLowerFast();
+                    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp")
+                    {
+                        if (File.GetLastWriteTimeUtc(file) >= threshold)
+                        {
+                            await ProcessFileForEncryption(file);
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logs.Debug($"[Swarmui-Image-Encriptor] Directory sweep error: {ex.Message}");
         }
     }
 
