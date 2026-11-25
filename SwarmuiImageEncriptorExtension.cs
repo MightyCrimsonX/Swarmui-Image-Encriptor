@@ -3,10 +3,8 @@ using FreneticUtilities.FreneticToolkit;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Primitives;
+using ImageMagick;
 using Newtonsoft.Json.Linq;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Formats.Jpeg;
-using SixLabors.ImageSharp.Processing;
 using SwarmUI.Accounts;
 using SwarmUI.Core;
 using SwarmUI.Media;
@@ -20,7 +18,6 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
 using Image = SwarmUI.Utils.Image;
-using ISImage = SixLabors.ImageSharp.Image;
 
 namespace SwarmuiImageEncriptorExtension;
 
@@ -99,7 +96,7 @@ public class SwarmuiImageEncriptorExtension : Extension
         API.RegisterAPICall(ImageEncryptor_VerifyCode, false, PermUseImageEncryptor);
         API.RegisterAPICall(ImageEncryptor_EncryptRaw, false, PermUseImageEncryptor);
 
-        T2IEngine.PostGenerateEvent += OnPostGenerate;
+        T2IEngine.PreGenerateEvent += OnPreGenerate;
         T2IEngine.PostBatchEvent += OnPostBatch;
 
         StartWatcher();
@@ -281,28 +278,7 @@ public class SwarmuiImageEncriptorExtension : Extension
                 {
                     try
                     {
-                        using ISImage isImg = ISImage.Load(decryptedBytes);
-                        int maxDim = 256;
-                        if (isImg.Width > maxDim || isImg.Height > maxDim)
-                        {
-                            int newW = isImg.Width;
-                            int newH = isImg.Height;
-                            if (newW > newH)
-                            {
-                                newH = (int)((double)newH * maxDim / newW);
-                                newW = maxDim;
-                            }
-                            else
-                            {
-                                newW = (int)((double)newW * maxDim / newH);
-                                newH = maxDim;
-                            }
-                            isImg.Mutate(x => x.Resize(newW, newH));
-                        }
-
-                        using MemoryStream ms = new();
-                        isImg.SaveAsJpeg(ms);
-                        byte[] previewBytes = ms.ToArray();
+                        byte[] previewBytes = CreateThumbnailJpeg(decryptedBytes);
 
                         context.Response.ContentType = "image/jpeg";
                         context.Response.Headers.CacheControl = "private, max-age=60";
@@ -730,6 +706,31 @@ public class SwarmuiImageEncriptorExtension : Extension
         return fullPath;
     }
 
+    /// <summary>Generates a JPEG thumbnail byte array resized to fit within <paramref name="maxDim"/> pixels.</summary>
+    public static byte[] CreateThumbnailJpeg(byte[] imageBytes, uint maxDim = 256)
+    {
+        using MagickImage img = new(imageBytes);
+        if (img.Width > maxDim || img.Height > maxDim)
+        {
+            uint newW = img.Width;
+            uint newH = img.Height;
+            if (newW > newH)
+            {
+                newH = Math.Max(1u, (uint)((double)newH * maxDim / newW));
+                newW = maxDim;
+            }
+            else
+            {
+                newW = Math.Max(1u, (uint)((double)newW * maxDim / newH));
+                newH = maxDim;
+            }
+            img.Resize(new MagickGeometry(newW, newH) { IgnoreAspectRatio = true });
+            img.ResetPage();
+        }
+        img.Quality = 75;
+        return img.ToByteArray(MagickFormat.Jpeg);
+    }
+
     /// <summary>Generates and stores the image preview thumbnail and metadata directly into LiteDB using in-memory bytes so unencrypted files never need to touch disk.</summary>
     public static void PrecachePreviewAndMetadata(string fullPath, byte[] unencryptedData, string rawMetadata)
     {
@@ -748,27 +749,7 @@ public class SwarmuiImageEncriptorExtension : Extension
             byte[] thumbBytes = null;
             try
             {
-                using ISImage isImg = ISImage.Load(unencryptedData);
-                int maxDim = 256;
-                if (isImg.Width > maxDim || isImg.Height > maxDim)
-                {
-                    int newW = isImg.Width;
-                    int newH = isImg.Height;
-                    if (newW > newH)
-                    {
-                        newH = (int)((double)newH * maxDim / newW);
-                        newW = maxDim;
-                    }
-                    else
-                    {
-                        newW = (int)((double)newW * maxDim / newH);
-                        newH = maxDim;
-                    }
-                    isImg.Mutate(x => x.Resize(newW, newH));
-                }
-                using MemoryStream ms = new();
-                isImg.SaveAsJpeg(ms);
-                thumbBytes = ms.ToArray();
+                thumbBytes = CreateThumbnailJpeg(unencryptedData);
             }
             catch (Exception ex)
             {
@@ -812,28 +793,28 @@ public class SwarmuiImageEncriptorExtension : Extension
         }
     }
 
-    /// <summary>Handles post-generation event to intercept the generation in RAM and prevent raw unencrypted bytes from ever touching disk.</summary>
-    public static void OnPostGenerate(T2IEngine.PostGenerationEventParams postParams)
+    /// <summary>Handles pre-generation event to mark the per-image input as DoNotSave so SwarmUI core never writes unencrypted bytes to disk.</summary>
+    public static void OnPreGenerate(T2IEngine.PreGenerationEventParams preParams)
     {
         try
         {
-            (bool isEnabled, string code) = GetActiveEncryptionState(postParams.UserInput.SourceSession);
+            (bool isEnabled, string code) = GetActiveEncryptionState(preParams.UserInput.SourceSession);
             if (isEnabled && !string.IsNullOrWhiteSpace(code))
             {
-                // Instruct SwarmUI core to NOT save the raw unencrypted file to disk:
-                postParams.UserInput.Set(T2IParamTypes.DoNotSave, true);
-                postParams.UserInput.ExtraMeta["encrypted_with"] = "AES-256-GCM-RAM";
+                // Instruct SwarmUI core to NOT save the raw unencrypted file to disk (must be set before CreateImageTask clones user_input):
+                preParams.UserInput.Set(T2IParamTypes.DoNotSave, true);
+                preParams.UserInput.ExtraMeta["encrypted_with"] = "AES-256-GCM-RAM";
 
                 // Ensure SwarmUI embeds metadata and reformats transient images so the WebSocket data URL has embedded metadata:
-                if (postParams.UserInput.SourceSession?.User?.Settings?.FileFormat is not null)
+                if (preParams.UserInput.SourceSession?.User?.Settings?.FileFormat is not null)
                 {
-                    postParams.UserInput.SourceSession.User.Settings.FileFormat.ReformatTransientImages = true;
+                    preParams.UserInput.SourceSession.User.Settings.FileFormat.ReformatTransientImages = true;
                 }
             }
         }
         catch (Exception ex)
         {
-            Logs.Error($"[Swarmui-Image-Encriptor] Error during post-generation hook: {ex.ReadableString()}");
+            Logs.Error($"[Swarmui-Image-Encriptor] Error during pre-generation hook: {ex.ReadableString()}");
         }
     }
 
@@ -842,6 +823,10 @@ public class SwarmuiImageEncriptorExtension : Extension
     {
         try
         {
+            if (batchParams.UserInput.Get(T2IParamTypes.DoNotSave, false))
+            {
+                return;
+            }
             (bool isEnabled, string code) = GetActiveEncryptionState(batchParams.UserInput.SourceSession);
             if (!isEnabled || string.IsNullOrWhiteSpace(code))
             {
